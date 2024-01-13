@@ -49,6 +49,7 @@ class SequenceGenerator:
         init_state: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         prompts: List[str],
         last_state: GenerationState,
+        num_samples: int,
     ) -> List[torch.Tensor]:
         """Get the tokens generated so far.
 
@@ -60,6 +61,8 @@ class SequenceGenerator:
             The prompts passed to the generator.
         last_state
             The current state of the generation
+        num_samples
+            The number of samples taken for each sequence
 
         Returns
         -------
@@ -67,11 +70,19 @@ class SequenceGenerator:
 
         """
         prompt_token_ids = init_state[0]
-        prompt_lengths = [len(prompt_token_ids[i]) for i in range(len(prompts))]
+        prompt_lengths = [
+            len(prompt_token_ids[i])
+            for _ in range(num_samples)
+            for i in range(len(prompts))
+        ]
+
+        # We flatten the obtained token_ids since the tokenizer's decoder
+        # only accepts tensor with two dimensions
+        token_ids = last_state.token_ids.reshape((-1, last_state.token_ids.shape[-1]))
 
         token_ids = [
             cur_token_ids[length:]
-            for cur_token_ids, length in zip(last_state.token_ids, prompt_lengths)
+            for cur_token_ids, length in zip(token_ids, prompt_lengths)
         ]
 
         return token_ids
@@ -150,9 +161,10 @@ class SequenceGenerator:
         prompts: Union[str, List[str]],
         max_tokens: Optional[int] = None,
         stop_at: Optional[Union[str, List[str]]] = None,
+        num_samples: int = 1,
         rng: Optional[torch.Generator] = None,
         kv_cache: Optional[torch.tensor] = None,
-    ) -> Union[str, List[str]]:
+    ) -> Union[str, List[str], List[List[str]]]:
         """Generate the full text sequence.
 
         Since `SequenceGenerator.stream` calls the tokenizer at every step this
@@ -205,7 +217,12 @@ class SequenceGenerator:
         init_fsm_states = [FSMState(0) for _ in range(num_sequences)]
 
         states = sequence_generator(
-            self.generate_token, fsms, init_state, init_fsm_states, rng
+            self.generate_token,
+            fsms,
+            init_state,
+            init_fsm_states,
+            rng=rng,
+            num_samples=num_samples,
         )
 
         while True:
@@ -213,7 +230,7 @@ class SequenceGenerator:
                 last_state = next(states)
                 if max_tokens or stop_sequences:
                     generated_token_ids = self.get_generated_token_ids(
-                        init_state, prompts, last_state
+                        init_state, prompts, last_state, num_samples
                     )
                     if max_tokens and len(generated_token_ids[0]) >= max_tokens:
                         break
@@ -225,8 +242,9 @@ class SequenceGenerator:
                 break
 
         generated_token_ids = self.get_generated_token_ids(
-            init_state, prompts, last_state
+            init_state, prompts, last_state, num_samples
         )
+
         generated = self.tokenizer.decode(generated_token_ids)
         stripped = [
             self.strip_stop_sequences(sequence, stop_sequences)
@@ -242,16 +260,29 @@ class SequenceGenerator:
                 + " is raised nevertheless please open an issue: https://github.com/outlines-dev/outlines/issues"
             )
 
-        return formatted if len(formatted) > 1 else formatted[0]
+        # We reshape the output to (sample_size, batch_size)
+        output = []
+        step = len(prompts)
+        for i in range(0, len(formatted), step):
+            output.append(formatted[i : i + step])
+
+        # We remove leading dimensions for the output
+        if len(prompts) == 1 and num_samples == 1:
+            return output[0][0]
+        elif num_samples == 1:
+            return output[0]
+        else:
+            return output
 
     def stream(
         self,
         prompts: Union[str, List[str]],
         max_tokens: Optional[int] = None,
         stop_at: Optional[Union[str, List[str]]] = None,
+        num_samples: int = 1,
         rng: Optional[torch.Generator] = None,
         kv_cache: Optional[torch.tensor] = None,
-    ) -> Iterator[Union[List[str], str]]:
+    ) -> Iterator[Union[List[str], List[List[str]], str]]:
         """Generate the text sequence one token at a time.
 
         Since `Tokenizer.decode` strips the whitespaces from the tokens we have no
@@ -303,13 +334,20 @@ class SequenceGenerator:
         init_fsm_states = [FSMState(0) for _ in range(num_sequences)]
 
         states = sequence_generator(
-            self.generate_token, fsms, init_state, init_fsm_states, rng
+            self.generate_token,
+            fsms,
+            init_state,
+            init_fsm_states,
+            num_samples=num_samples,
+            rng=rng,
         )
 
-        def token_generator() -> Iterator[Union[List[str], str]]:
-            previously_generated_sequences = ["" for _ in range(num_sequences)]
+        def token_generator() -> Iterator[Union[List[str], str, List[List[str]]]]:
+            previously_generated_sequences = [
+                "" for _ in range(num_sequences)
+            ] * num_samples
             num_generated = 0
-            is_stop_at_reached = [False for _ in range(num_sequences)]
+            is_stop_at_reached = [False for _ in range(num_sequences)] * num_samples
             while True:
                 if (max_tokens and num_generated >= max_tokens) or all(
                     is_stop_at_reached
@@ -320,7 +358,10 @@ class SequenceGenerator:
                     num_generated += 1
                 except StopIteration:
                     return
-                generated_token_ids = sequence.token_ids[:, -num_generated:]
+                generated_token_ids = sequence.token_ids[:, :, -num_generated:]
+                generated_token_ids = generated_token_ids.reshape(
+                    -1, generated_token_ids.shape[-1]
+                )
                 generated_sequences = self.tokenizer.decode(generated_token_ids)
                 next_tokens = [
                     token[len(sequence) :] if not stop else ""
@@ -341,7 +382,19 @@ class SequenceGenerator:
                             generated_sequences, is_stop_at_reached
                         )
                     ]
-                yield next_tokens
+                # We reshape the output to (sample_size, batch_size)
+                output = []
+                step = len(prompts)
+                for i in range(0, len(next_tokens), step):
+                    output.append(next_tokens[i : i + step])
+
+                # We remove leading dimensions for the output
+                if len(prompts) == 1 and num_samples == 1:
+                    yield output[0][0]
+                elif num_samples == 1:
+                    yield output[0]
+                else:
+                    yield output
 
         return token_generator()
 
