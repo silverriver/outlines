@@ -57,10 +57,11 @@ test = [
     "huggingface_hub"
 ]
 serve = [
-    "vllm==0.2.6",
+    "vllm",
     "ray==2.9.0",
     "uvicorn",
     "fastapi"
+    "pydantic>=2.0"
 ]
 
 [project.urls]
